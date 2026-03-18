@@ -189,7 +189,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@0c0c5dc2f136b98cb0537075ccfa21f94cd9a63e # codeql-bundle-v2.24.3
+        uses: github/codeql-action/upload-sarif@7da6361ba56d9e2aa798049c7f0a046fe133921e # codeql-bundle-v2.24.3
         with:
           sarif_file: "trivy-results.sarif"
         if: always() && hashFiles('trivy-results.sarif') != ''
