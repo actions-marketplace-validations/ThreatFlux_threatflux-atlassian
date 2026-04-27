@@ -483,9 +483,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fluxencrypt"
-version = "0.5.0"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70152f97407d30a777b875bf5795fa09c0c3dc97ef47587015eebc83b8bc8f13"
+checksum = "94070bce3c9f597770d06c68670849494582952138f3aadbf981aeee9b266ed1"
 dependencies = [
  "anyhow",
  "base64",
