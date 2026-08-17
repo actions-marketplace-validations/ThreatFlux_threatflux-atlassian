@@ -1,7 +1,7 @@
 //! Data structures for Jira API objects
 //!
-//! This module contains comprehensive data structures for Jira issues, projects,
-//! users, and other API objects used throughout the Atlassian SDK.
+//! This module contains the focused Jira issue, project, user, and field models used
+//! by the implemented client methods.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,14 +14,14 @@ pub struct JiraIssue {
     pub key: String,
     /// Issue ID (numeric)
     pub id: String,
-    /// Issue fields containing all the data
+    /// Issue fields modeled by this crate
     pub fields: IssueFields,
     /// Self URL for the issue
     #[serde(rename = "self")]
     pub self_url: Option<String>,
 }
 
-/// Issue fields containing all issue data
+/// Issue fields modeled by this crate.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct IssueFields {
     /// Issue summary/title
@@ -54,7 +54,7 @@ pub struct IssueFields {
     pub components: Vec<Component>,
     /// Parent issue (for subtasks)
     pub parent: Option<Box<JiraIssue>>,
-    /// Custom fields (using HashMap for flexibility)
+    /// Custom fields (using `HashMap` for flexibility)
     #[serde(flatten)]
     pub custom_fields: HashMap<String, serde_json::Value>,
 }
@@ -175,6 +175,13 @@ pub struct CreateIssueRequest {
 }
 
 /// Fields for creating a new issue
+///
+/// Every optional field is omitted from the request body when it is `None`
+/// rather than sent as an explicit `null`. The two forms are not
+/// interchangeable to Jira: `"parent": null` on an issue type that is not a
+/// subtask is rejected outright, and a `null` for a field the project's create
+/// screen does not expose fails the same way. Deserialization is unaffected --
+/// an absent optional still reads back as `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CreateIssueFields {
     /// Project key or ID
@@ -185,18 +192,27 @@ pub struct CreateIssueFields {
     #[serde(rename = "issuetype")]
     pub issue_type: IssueTypeReference,
     /// Issue description (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Assignee (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<UserReference>,
     /// Priority (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<PriorityReference>,
     /// Labels (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
     /// Components (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<ComponentReference>>,
     /// Parent issue for subtasks (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<IssueReference>,
     /// Custom fields
+    ///
+    /// Flattened, so an empty map already contributes nothing to the body and
+    /// needs no `skip_serializing_if` of its own.
     #[serde(flatten)]
     pub custom_fields: HashMap<String, serde_json::Value>,
 }
@@ -348,7 +364,7 @@ pub struct FieldSchema {
 impl ProjectReference {
     /// Create a project reference by key
     pub fn by_key(key: impl Into<String>) -> Self {
-        ProjectReference {
+        Self {
             key: Some(key.into()),
             id: None,
         }
@@ -356,7 +372,7 @@ impl ProjectReference {
 
     /// Create a project reference by ID
     pub fn by_id(id: impl Into<String>) -> Self {
-        ProjectReference {
+        Self {
             key: None,
             id: Some(id.into()),
         }
@@ -366,7 +382,7 @@ impl ProjectReference {
 impl IssueTypeReference {
     /// Create an issue type reference by name
     pub fn by_name(name: impl Into<String>) -> Self {
-        IssueTypeReference {
+        Self {
             name: Some(name.into()),
             id: None,
         }
@@ -374,7 +390,7 @@ impl IssueTypeReference {
 
     /// Create an issue type reference by ID
     pub fn by_id(id: impl Into<String>) -> Self {
-        IssueTypeReference {
+        Self {
             name: None,
             id: Some(id.into()),
         }
@@ -384,7 +400,7 @@ impl IssueTypeReference {
 impl UserReference {
     /// Create a user reference by account ID (cloud)
     pub fn by_account_id(account_id: impl Into<String>) -> Self {
-        UserReference {
+        Self {
             account_id: Some(account_id.into()),
             name: None,
         }
@@ -392,7 +408,7 @@ impl UserReference {
 
     /// Create a user reference by username (server)
     pub fn by_name(name: impl Into<String>) -> Self {
-        UserReference {
+        Self {
             account_id: None,
             name: Some(name.into()),
         }
@@ -402,7 +418,7 @@ impl UserReference {
 impl IssueReference {
     /// Create an issue reference by key
     pub fn by_key(key: impl Into<String>) -> Self {
-        IssueReference {
+        Self {
             key: Some(key.into()),
             id: None,
         }
@@ -410,7 +426,7 @@ impl IssueReference {
 
     /// Create an issue reference by ID
     pub fn by_id(id: impl Into<String>) -> Self {
-        IssueReference {
+        Self {
             key: None,
             id: Some(id.into()),
         }
@@ -420,7 +436,7 @@ impl IssueReference {
 impl CustomFieldValue {
     /// Create a custom field value
     pub fn new(value: impl Into<String>) -> Self {
-        CustomFieldValue {
+        Self {
             value: Some(value.into()),
             id: None,
         }
@@ -428,7 +444,7 @@ impl CustomFieldValue {
 
     /// Create a custom field value with ID
     pub fn with_id(id: impl Into<String>) -> Self {
-        CustomFieldValue {
+        Self {
             value: None,
             id: Some(id.into()),
         }
@@ -475,6 +491,85 @@ mod tests {
 
         let field_with_id = CustomFieldValue::with_id("option123");
         assert_eq!(field_with_id.id, Some("option123".to_string()));
+    }
+
+    #[test]
+    fn create_issue_fields_omit_absent_optionals() {
+        let fields = CreateIssueFields {
+            project: ProjectReference::by_key("TEST"),
+            summary: "Summary".to_string(),
+            issue_type: IssueTypeReference::by_name("Task"),
+            description: None,
+            assignee: None,
+            priority: None,
+            labels: None,
+            components: None,
+            parent: None,
+            custom_fields: HashMap::new(),
+        };
+
+        // `"parent": null` is rejected by Jira on any issue type that is not a
+        // subtask, so an absent optional has to be absent from the body rather
+        // than an explicit null. The nested references still spell their own
+        // unset members as `null`; narrowing those is a separate change.
+        assert_eq!(
+            serde_json::to_value(&fields).expect("serializes"),
+            serde_json::json!({
+                "project": {"key": "TEST", "id": null},
+                "summary": "Summary",
+                "issuetype": {"name": "Task", "id": null}
+            })
+        );
+    }
+
+    #[test]
+    fn create_issue_fields_still_read_back_from_a_body_without_them() {
+        // `skip_serializing_if` is a write-side change only: a body missing every
+        // optional still deserializes, with each one landing on `None`.
+        let fields: CreateIssueFields = serde_json::from_value(serde_json::json!({
+            "project": {"key": "TEST"},
+            "summary": "Summary",
+            "issuetype": {"name": "Task"}
+        }))
+        .expect("deserializes");
+
+        assert_eq!(fields.summary, "Summary");
+        assert_eq!(fields.description, None);
+        assert_eq!(fields.parent, None);
+        assert_eq!(fields.labels, None);
+        assert!(fields.custom_fields.is_empty());
+    }
+
+    #[test]
+    fn create_issue_fields_keep_the_optionals_that_are_set() {
+        let fields = CreateIssueFields {
+            project: ProjectReference::by_key("TEST"),
+            summary: "Summary".to_string(),
+            issue_type: IssueTypeReference::by_name("Sub-task"),
+            description: Some("body".to_string()),
+            assignee: None,
+            priority: None,
+            labels: Some(vec!["dedupe-abc".to_string()]),
+            components: None,
+            parent: Some(IssueReference::by_key("TEST-1")),
+            custom_fields: HashMap::from([(
+                "customfield_10010".to_string(),
+                serde_json::json!("value"),
+            )]),
+        };
+
+        let body = serde_json::to_value(&fields).expect("serializes");
+        assert_eq!(body["description"], serde_json::json!("body"));
+        assert_eq!(body["labels"], serde_json::json!(["dedupe-abc"]));
+        assert_eq!(
+            body["parent"],
+            serde_json::json!({"key": "TEST-1", "id": null})
+        );
+        assert_eq!(body["customfield_10010"], serde_json::json!("value"));
+        assert!(
+            body.get("assignee").is_none() && body.get("components").is_none(),
+            "an unset optional must not appear at all: {body}"
+        );
     }
 
     #[test]

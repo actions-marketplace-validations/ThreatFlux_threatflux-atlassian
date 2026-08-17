@@ -3,42 +3,91 @@ members = [
     "crates/threatflux-atlassian-sdk",
     "crates/threatflux-atlassian-cli",
     "crates/threatflux-atlassian-action",
+    "crates/threatflux-atlassian-testkit",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.1"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.96.0"
 license = "MIT"
 repository = "https://github.com/ThreatFlux/threatflux-atlassian"
 homepage = "https://github.com/ThreatFlux/threatflux-atlassian"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
-base64 = "0.22.1"
+base64 = "0.23.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.54", features = ["derive", "env"] }
-threatflux-atlassian-sdk = { path = "crates/threatflux-atlassian-sdk", version = "0.4.2" }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+# `default-features = false` has to live here, not on the member entries. When a
+# member writes `threatflux-atlassian-sdk = { workspace = true, default-features
+# = false }` and this table does not spell `default-features` out, cargo drops
+# the member's value with only a warning and builds the default feature set
+# anyway. Members that want `full` -- and with it `encrypted-env`, which pulls in
+# fluxencrypt and rsa -- opt back in with an explicit `features` list.
+threatflux-atlassian-sdk = { path = "crates/threatflux-atlassian-sdk", version = "0.5.1", default-features = false }
+# threatflux-atlassian-testkit is deliberately absent from this table. It is a
+# dev-only member that each consumer declares as a bare path dev-dependency with
+# no `version` field, so `cargo publish` strips the entry; inheriting it from
+# here would also make `cargo deny` unable to resolve the versionless entry.
 dotenvy = "0.15"
-fluxencrypt = "0.5.0"
-rand = "0.10.0"
-reqwest = { version = "0.13.2", default-features = false, features = ["form", "json", "query", "rustls"] }
+fluxencrypt = "0.7.2"
+# Hex encoding for the dedupe label digests. The Action's legacy label ladder
+# has to reproduce an existing on-Jira label byte for byte, so the encoding is a
+# wire format rather than a formatting detail; a shared, lowercase-only encoder
+# is one fewer place for a `{:02X}` to silently move a label.
+hex = "0.4.3"
+rand = "0.10.1"
+reqwest = { version = "0.13.2", default-features = false, features = ["form", "json", "multipart", "query", "rustls"] }
 regex = "1.12.2"
-schemars = "0.8"
+schemars = "1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde_yml = "0.0.12"
-serial_test = "3.3.1"
-sha2 = "0.10.9"
+yaml_serde = "0.10.4"
+serial_test = "4.0.1"
+# SHA-1 is here for one reason: recognising legacy dedupe labels that an earlier
+# generation of per-repo routing scripts wrote onto issues that are still open.
+# Nothing in this workspace *mints* a SHA-1 label -- `LegacyLabelSpec` can only
+# be pointed at one to read it -- so this is a compatibility decoder and not a
+# security primitive. Kept on the same major as `sha2` so both resolve the one
+# `digest` trait.
+sha1 = "0.11.0"
+sha2 = "0.11.0"
 thiserror = "2.0.17"
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.52.1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
 tokio-test = "0.4"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 url = { version = "2.5.8", features = ["serde"] }
-uuid = { version = "1.19.0", features = ["serde", "v4"] }
+uuid = { version = "1.23.1", features = ["serde", "v4"] }
 wiremock = "0.6"
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+# Clippy levels live here, not in crate-root `#![allow(...)]` attributes: a
+# source-level allow outranks the `-D` flags CI passes on the command line, so a
+# single `#![allow(clippy::all)]` silently makes the whole strict invocation
+# vacuous. Every member opts in with `[lints] workspace = true`, and
+# `scripts/check_lint_config.py` fails the build if an inner-attribute allow
+# comes back. Group entries need `priority = -1` so the individual allows below
+# them win. Nothing may repeat these levels on a command line either: cargo appends
+# `cargo clippy -- ...` args after the flags it derives from this table, so a
+# trailing `-D clippy::nursery` would re-deny the individual allows below.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+multiple_crate_versions = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Deriving `Eq` alongside `PartialEq` on the public types in `types.rs` is a
+# forward commitment that cannot be withdrawn: the first field that is not `Eq`
+# -- an `f64`, a `serde_json::Value` -- would force removing the impl, and that
+# is a breaking change. Keep the door open rather than auto-fixing.
+derive_partial_eq_without_eq = "allow"
 
 [profile.release]
 lto = true

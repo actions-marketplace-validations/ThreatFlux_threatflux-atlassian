@@ -1,10 +1,15 @@
-//! Atlassian Remote MCP Server client implementation
+//! Legacy Atlassian Remote MCP client implementation.
 //!
-//! This module provides a client for connecting to Atlassian's Remote MCP Server
-//! at <https://mcp.atlassian.com/v1/sse> using OAuth 2.1 authentication and MCP protocol.
+//! This module is retained for API compatibility and migration assessment. It targets
+//! `https://mcp.atlassian.com/v1/sse`, which Atlassian stopped supporting after
+//! June 30, 2026. It does not implement the current Streamable HTTP transport and is
+//! not usable with today's Atlassian Rovo MCP service.
 
 use crate::auth::{AccessToken, McpAuthHandler};
-use crate::error::{AtlassianError, Result};
+use crate::error::{
+    bounded, map_error_response, AtlassianError, DiagnosticsPolicy, FailureContext, FailureShape,
+    ResponseDiagnostics, Result,
+};
 use crate::types::{IssueSearchResult, JiraIssue, JiraUser, Project};
 use reqwest::Client;
 use serde_json::Value;
@@ -14,7 +19,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-/// Atlassian Remote MCP Server client
+/// Legacy Remote MCP client that is incompatible with Atlassian's current service.
+///
+/// The client does not start an OAuth callback listener or persist tokens. Prefer the
+/// direct [`crate::AtlassianClient`] for supported SDK use.
 #[derive(Debug)]
 pub struct AtlassianRemoteClient {
     /// HTTP client for MCP requests
@@ -23,6 +31,8 @@ pub struct AtlassianRemoteClient {
     mcp_endpoint: Url,
     /// OAuth authentication handler
     auth_handler: Arc<RwLock<McpAuthHandler>>,
+    /// How much of a failing MCP response may reach an error
+    diagnostics: DiagnosticsPolicy,
 }
 
 /// MCP request wrapper
@@ -65,11 +75,11 @@ struct McpError {
 }
 
 impl AtlassianRemoteClient {
-    /// Create new Atlassian Remote MCP client
+    /// Create a client for the legacy, retired Remote MCP endpoint.
     ///
     /// # Arguments
     /// * `client_id` - OAuth client ID for Atlassian
-    /// * `callback_port` - Local port for OAuth callback server
+    /// * `callback_port` - Port embedded in the redirect URI; no callback server is started
     ///
     /// # Example
     /// ```rust,no_run
@@ -90,20 +100,32 @@ impl AtlassianRemoteClient {
         })?;
         let mcp_endpoint = Url::parse("https://mcp.atlassian.com/v1/sse")?;
 
-        let auth_handler = McpAuthHandler::new(client_id.clone(), callback_port)?;
+        let auth_handler = McpAuthHandler::new(client_id, callback_port)?;
         let auth_handler = Arc::new(RwLock::new(auth_handler));
 
-        Ok(AtlassianRemoteClient {
+        Ok(Self {
             client,
             mcp_endpoint,
             auth_handler,
+            diagnostics: DiagnosticsPolicy::default(),
         })
     }
 
-    /// Initialize authentication flow
+    /// Choose how much of a failing MCP response may reach an error.
     ///
-    /// Returns authorization response that should be presented to the user
-    /// This includes the auth URL and instructions for completing OAuth flow
+    /// The default is [`DiagnosticsPolicy::MetadataOnly`]. The setting covers this
+    /// client's own MCP requests; the OAuth token requests it makes through
+    /// [`McpAuthHandler`] stay at the default.
+    #[must_use]
+    pub const fn with_diagnostics(mut self, policy: DiagnosticsPolicy) -> Self {
+        self.diagnostics = policy;
+        self
+    }
+
+    /// Generate the legacy authorization response.
+    ///
+    /// This returns an authorization URL but does not open a browser or start a callback
+    /// listener. The flow targets the retired Remote MCP implementation.
     pub async fn initialize_auth(&self) -> Result<Value> {
         info!("Initializing Atlassian OAuth authentication");
 
@@ -111,7 +133,7 @@ impl AtlassianRemoteClient {
         auth_handler.generate_auth_response().await
     }
 
-    /// Complete OAuth flow with authorization code
+    /// Complete the legacy OAuth flow with a caller-supplied authorization code and state.
     pub async fn complete_auth(&self, code: String, state: Option<String>) -> Result<AccessToken> {
         info!("Completing OAuth authorization flow");
 
@@ -119,7 +141,7 @@ impl AtlassianRemoteClient {
         auth_handler.process_callback(code, state).await
     }
 
-    /// Check if client is authenticated
+    /// Check whether a non-expired in-memory access token is present.
     pub async fn is_authenticated(&self) -> bool {
         let auth_handler = self.auth_handler.read().await;
         !auth_handler.needs_reauth().await
@@ -165,22 +187,11 @@ impl AtlassianRemoteClient {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-
-            return Err(match status.as_u16() {
-                401 => AtlassianError::auth("Authentication failed - token may be expired"),
-                403 => AtlassianError::PermissionDenied {
-                    message: "Insufficient permissions for Atlassian resources".to_string(),
-                },
-                429 => AtlassianError::RateLimit {
-                    message: "Rate limit exceeded".to_string(),
-                },
-                _ => AtlassianError::http(
-                    format!("MCP request failed: {error_text}"),
-                    Some(status.as_u16()),
-                ),
-            });
+            return Err(map_error_response(
+                response,
+                FailureContext::new(FailureShape::RemoteMcp, "MCP request", self.diagnostics),
+            )
+            .await);
         }
 
         let mcp_response: McpResponse = response.json().await?;
@@ -188,7 +199,7 @@ impl AtlassianRemoteClient {
         // Check for MCP-level errors
         if let Some(error) = mcp_response.error {
             return Err(AtlassianError::jira_api(
-                format!("MCP error: {} (code: {})", error.message, error.code),
+                Self::mcp_error_message(&error, self.diagnostics),
                 Some(error.code),
             ));
         }
@@ -198,7 +209,24 @@ impl AtlassianRemoteClient {
             .ok_or_else(|| AtlassianError::parse("No result in MCP response".to_string()))
     }
 
-    /// Get Jira issue via Remote MCP Server
+    /// Renders a JSON-RPC error under `policy`.
+    ///
+    /// A JSON-RPC error arrives on a 200, so it never reaches the failure seam --
+    /// but its `message` is server-supplied response text on the same footing as an
+    /// error body, and it is released under the same policy and the same bound.
+    fn mcp_error_message(error: &McpError, policy: DiagnosticsPolicy) -> String {
+        if policy == DiagnosticsPolicy::MetadataOnly {
+            format!("MCP error (code: {})", error.code)
+        } else {
+            format!(
+                "MCP error: {} (code: {})",
+                bounded(&error.message, ResponseDiagnostics::MESSAGE_LIMIT),
+                error.code
+            )
+        }
+    }
+
+    /// Send the legacy, currently unsupported payload for reading a Jira issue.
     ///
     /// # Arguments
     /// * `issue_key` - Issue key (e.g., "PROJ-123")
@@ -231,7 +259,7 @@ impl AtlassianRemoteClient {
             .map_err(|e| AtlassianError::parse(format!("Failed to parse issue response: {e}")))
     }
 
-    /// Update Jira issue via Remote MCP Server
+    /// Send the legacy, currently unsupported payload for updating a Jira issue.
     ///
     /// # Arguments
     /// * `issue_key` - Issue key to update
@@ -271,7 +299,7 @@ impl AtlassianRemoteClient {
         Ok(())
     }
 
-    /// Search Jira issues via Remote MCP Server
+    /// Send the legacy, currently unsupported payload for searching Jira issues.
     ///
     /// # Arguments
     /// * `jql` - Jira Query Language string
@@ -306,7 +334,7 @@ impl AtlassianRemoteClient {
             .map_err(|e| AtlassianError::parse(format!("Failed to parse search response: {e}")))
     }
 
-    /// Get current user via Remote MCP Server
+    /// Send the legacy, currently unsupported payload for reading the current user.
     pub async fn get_myself(&self) -> Result<JiraUser> {
         info!("Getting current user via Remote MCP");
 
@@ -322,7 +350,7 @@ impl AtlassianRemoteClient {
             .map_err(|e| AtlassianError::parse(format!("Failed to parse user response: {e}")))
     }
 
-    /// Get accessible projects via Remote MCP Server
+    /// Send the legacy, currently unsupported payload for listing projects.
     pub async fn get_projects(&self) -> Result<Vec<Project>> {
         info!("Getting accessible projects via Remote MCP");
 
@@ -338,7 +366,7 @@ impl AtlassianRemoteClient {
             .map_err(|e| AtlassianError::parse(format!("Failed to parse projects response: {e}")))
     }
 
-    /// Update story points via Remote MCP Server (common operation from Python examples)
+    /// Send the legacy, currently unsupported payload for updating story points.
     pub async fn update_story_points(
         &self,
         issue_key: &str,
@@ -359,7 +387,7 @@ impl AtlassianRemoteClient {
         self.update_issue(issue_key, fields).await
     }
 
-    /// Update custom field via Remote MCP Server (like improvement area from Python examples)
+    /// Send the legacy, currently unsupported payload for updating a custom field.
     pub async fn update_custom_field(
         &self,
         issue_key: &str,
@@ -377,7 +405,7 @@ impl AtlassianRemoteClient {
         self.update_issue(issue_key, fields).await
     }
 
-    /// Create Jira issue via Remote MCP Server
+    /// Send the legacy, currently unsupported payload for creating a Jira issue.
     pub async fn create_issue(
         &self,
         summary: &str,
@@ -405,7 +433,7 @@ impl AtlassianRemoteClient {
         })
     }
 
-    /// Health check for Remote MCP Server connection
+    /// Attempt a health check against the legacy, retired Remote MCP endpoint.
     pub async fn health_check(&self) -> Result<bool> {
         info!("Performing health check for Atlassian Remote MCP Server");
 
@@ -430,7 +458,7 @@ impl AtlassianRemoteClient {
         }
     }
 
-    /// Get list of available MCP tools from Atlassian Remote Server
+    /// Send the legacy, currently unsupported payload for listing MCP tools.
     pub async fn list_tools(&self) -> Result<Vec<Value>> {
         info!("Listing available MCP tools from Atlassian Remote Server");
 
@@ -447,7 +475,7 @@ impl AtlassianRemoteClient {
         }
     }
 
-    /// Call specific MCP tool on Atlassian Remote Server
+    /// Send the legacy, currently unsupported payload for calling an MCP tool.
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         info!(
             "Calling MCP tool '{}' on Atlassian Remote Server",
@@ -462,7 +490,7 @@ impl AtlassianRemoteClient {
         self.make_mcp_request("tools/call", Some(params)).await
     }
 
-    /// Convenience method for Jira operations via MCP tools
+    /// Construct the legacy, unverified Jira tool payload.
     pub async fn jira_operation(
         &self,
         operation: &str,
@@ -491,7 +519,7 @@ impl AtlassianRemoteClient {
         self.call_tool("jira", Value::Object(tool_args)).await
     }
 
-    /// Convenience method for Confluence operations via MCP tools
+    /// Construct the legacy, unverified Confluence tool payload.
     pub async fn confluence_operation(&self, operation: &str, params: Value) -> Result<Value> {
         info!("Performing Confluence operation '{}' via MCP", operation);
 
@@ -510,7 +538,7 @@ impl AtlassianRemoteClient {
         self.call_tool("confluence", Value::Object(tool_args)).await
     }
 
-    /// Convenience method for Compass operations via MCP tools
+    /// Construct the legacy, unverified Compass tool payload.
     pub async fn compass_operation(&self, operation: &str, params: Value) -> Result<Value> {
         info!("Performing Compass operation '{}' via MCP", operation);
 
@@ -533,6 +561,42 @@ impl AtlassianRemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mcp_response_body_is_withheld_unless_the_caller_asks_for_it() {
+        let client = AtlassianRemoteClient::new("test-client-id".to_string(), 8080).unwrap();
+
+        assert_eq!(client.diagnostics, DiagnosticsPolicy::MetadataOnly);
+        assert_eq!(
+            client
+                .with_diagnostics(DiagnosticsPolicy::JiraErrorFields)
+                .diagnostics,
+            DiagnosticsPolicy::JiraErrorFields
+        );
+    }
+
+    #[test]
+    fn an_mcp_error_message_follows_the_same_policy_as_a_response_body() {
+        const MARKER: &str = "server-supplied-text-that-must-not-escape";
+        let error = McpError {
+            code: -32603,
+            message: format!("{MARKER} {}", "x".repeat(4096)),
+            data: None,
+        };
+
+        let withheld =
+            AtlassianRemoteClient::mcp_error_message(&error, DiagnosticsPolicy::MetadataOnly);
+        assert_eq!(withheld, "MCP error (code: -32603)");
+        assert!(!withheld.contains(MARKER));
+
+        let released =
+            AtlassianRemoteClient::mcp_error_message(&error, DiagnosticsPolicy::IncludeBody);
+        assert!(released.contains(MARKER));
+        assert!(
+            released.chars().count() < ResponseDiagnostics::MESSAGE_LIMIT + 64,
+            "released: {released}"
+        );
+    }
 
     #[test]
     fn test_remote_client_creation() {

@@ -27,7 +27,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUST_VERSION: 1.94.0
+  RUST_VERSION: 1.97.1
   BINARY_NAME: tflux-atlassian
   CLI_PACKAGE: threatflux-atlassian-cli
   SDK_PACKAGE: threatflux-atlassian-sdk
@@ -54,7 +54,7 @@ jobs:
           echo "source_ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ steps.source_ref.outputs.source_ref }}
@@ -162,7 +162,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.source_ref }}
 
@@ -188,6 +188,7 @@ jobs:
 
       - name: Build (native)
         if: "!matrix.use_cross"
+        shell: bash
         run: cargo build --release --target ${{ matrix.target }} -p ${{ env.CLI_PACKAGE }} --bin ${{ env.BINARY_NAME }} --all-features
 
       - name: Package (Unix)
@@ -206,12 +207,14 @@ jobs:
         run: |
           mkdir dist
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" dist/
-          Compress-Archive -Path dist/* -DestinationPath "${{ env.BINARY_NAME }}-${{ matrix.artifact }}.zip"
-          Get-FileHash "${{ env.BINARY_NAME }}-${{ matrix.artifact }}.zip" -Algorithm SHA256 | Format-List
+          $archive = "${{ env.BINARY_NAME }}-${{ matrix.artifact }}.zip"
+          Compress-Archive -Path dist/* -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
 
       - name: Upload artifacts (Unix)
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.artifact }}
           path: "*.tar.gz*"
@@ -219,10 +222,10 @@ jobs:
 
       - name: Upload artifacts (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.artifact }}
-          path: "*.zip"
+          path: "*.zip*"
           retention-days: 5
 
   # ==========================================================================
@@ -234,7 +237,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.source_ref }}
 
@@ -244,7 +247,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@5ab5d1729c22acd8f798b267eadcfe5e5be6f5c2 # v2.68.27
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
         with:
           tool: cargo-cyclonedx@0.5.8
 
@@ -256,7 +259,7 @@ jobs:
           mv sbom/threatflux-atlassian-cli-sbom.json "sbom/threatflux-atlassian-cli-v${VERSION}.cdx.json"
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-sbom
           path: sbom/*.json
@@ -298,7 +301,7 @@ jobs:
     if: "!contains(needs.prepare.outputs.version, '-')"
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.source_ref }}
 

@@ -1,5 +1,3 @@
-#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
-
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -20,11 +18,16 @@ use fluxencrypt::{Config as FluxConfig, HybridCipher};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{self, json};
-use threatflux_atlassian_sdk::{AtlassianClient, AtlassianConfig, CreateIssueRequest, JiraField};
+use threatflux_atlassian_sdk::{
+    AtlassianClient, AtlassianConfig, CreateIssueRequest, HostPolicy, JiraField, JqlBuilder,
+    SecretString, UpdateIssueRequest,
+};
 use tracing::Level;
 
 /// Default maximum number of issues to return when not specified.
 const DEFAULT_ISSUE_LIMIT: u32 = 50;
+/// Default maximum number of users to return when not specified.
+const DEFAULT_USER_LIMIT: u32 = 50;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,14 +44,36 @@ struct Cli {
     #[arg(long)]
     username: Option<String>,
     /// Provide the Jira API token (overrides environment configuration).
+    ///
+    /// `Cli` derives `Debug`, so this being a `SecretString` is what keeps a
+    /// `{:?}` of the parsed arguments — in a log line, in a panic payload — from
+    /// printing the token.
     #[arg(long)]
-    api_token: Option<String>,
+    api_token: Option<SecretString>,
     /// Request timeout in seconds.
     #[arg(long)]
     timeout: Option<u64>,
-    /// Disable TLS certificate verification.
+    /// Disable TLS certificate verification on an `https://` URL.
+    ///
+    /// Certificate verification only. This no longer admits an `http://` base
+    /// URL; pointing the CLI at a local mock needs `--host-policy loopback`.
     #[arg(long, default_value_t = false)]
     insecure: bool,
+    /// Restrict which hosts the credentials may be sent to.
+    ///
+    /// `atlassian-cloud` (the default), `allowlist:<host>[,<host>]` for a Data
+    /// Center deployment, or `loopback` for a local mock over `http://`.
+    #[arg(long, value_name = "POLICY")]
+    host_policy: Option<HostPolicy>,
+    /// Add one PEM or DER certificate as an extra trust root.
+    ///
+    /// This is the flag that replaced `JIRA_CERT_PATH`. An extra root can vouch
+    /// for whatever host the base URL names, so installing one relaxes
+    /// certificate verification for that destination — which the SDK reserves
+    /// for an explicit code call, exactly as it does `loopback`. A command line
+    /// is that call; a workflow environment is not.
+    #[arg(long, value_name = "PATH")]
+    cert_path: Option<PathBuf>,
     /// Custom user-agent string for requests.
     #[arg(long)]
     user_agent: Option<String>,
@@ -71,7 +96,7 @@ enum Commands {
         #[arg(value_name = "KEY")]
         issue: String,
     },
-    /// Search for issues using a JQL query string.
+    /// Compatibility search using upstream-deprecated GET /rest/api/2/search.
     IssueSearch {
         #[arg(long, value_name = "JQL", required = true)]
         jql: String,
@@ -80,14 +105,14 @@ enum Commands {
         #[arg(long, value_name = "LIMIT")]
         limit: Option<u32>,
     },
-    /// List all projects accessible to the user.
+    /// Compatibility project list using deprecated GET /rest/api/2/project.
     ProjectsList,
     /// Retrieve a specific project by key or ID.
     ProjectGet {
         #[arg(value_name = "KEY_OR_ID")]
         project: String,
     },
-    /// Search for issues within a project.
+    /// Compatibility project search using deprecated GET /rest/api/2/search.
     ProjectIssues {
         #[arg(value_name = "KEY")]
         project: String,
@@ -129,6 +154,99 @@ enum Commands {
         #[arg(long, value_name = "VALUE")]
         value: String,
     },
+    /// Update arbitrary issue fields from a JSON request body.
+    IssueUpdate {
+        #[arg(value_name = "KEY")]
+        issue: String,
+        #[arg(value_name = "PATH")]
+        request: PathBuf,
+    },
+    /// Add a standalone comment without changing issue workflow state.
+    IssueCommentAdd {
+        #[arg(value_name = "KEY")]
+        issue: String,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            conflicts_with = "body_file",
+            required_unless_present = "body_file"
+        )]
+        body: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "body",
+            required_unless_present = "body"
+        )]
+        body_file: Option<PathBuf>,
+    },
+    /// List comments on an issue.
+    IssueComments {
+        #[arg(value_name = "KEY")]
+        issue: String,
+        #[arg(long, value_name = "START")]
+        start: Option<u32>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<u32>,
+    },
+    /// Assign an issue by account ID or unassign it.
+    IssueAssign {
+        #[arg(value_name = "KEY")]
+        issue: String,
+        #[arg(
+            long,
+            value_name = "ACCOUNT_ID",
+            conflicts_with = "unassign",
+            required_unless_present = "unassign"
+        )]
+        account_id: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "account_id",
+            required_unless_present = "account_id"
+        )]
+        unassign: bool,
+    },
+    /// Search Jira users by display name, email, or supported query text.
+    UsersSearch {
+        #[arg(long, value_name = "QUERY", required = true)]
+        query: String,
+        #[arg(long, value_name = "START")]
+        start: Option<u32>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<u32>,
+    },
+    /// Create a link between two issues.
+    IssueLinkCreate {
+        #[arg(long, value_name = "NAME")]
+        link_type: String,
+        #[arg(long, value_name = "KEY")]
+        inward: String,
+        #[arg(long, value_name = "KEY")]
+        outward: String,
+    },
+    /// Delete an issue link by numeric link ID.
+    IssueLinkDelete {
+        #[arg(value_name = "LINK_ID")]
+        link_id: String,
+    },
+    /// Upload a file attachment to an issue.
+    IssueAttachmentAdd {
+        #[arg(value_name = "KEY")]
+        issue: String,
+        #[arg(value_name = "PATH")]
+        file: PathBuf,
+    },
+    /// Retrieve an issue changelog.
+    IssueChangelog {
+        #[arg(value_name = "KEY")]
+        issue: String,
+        #[arg(long, value_name = "START")]
+        start: Option<u32>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<u32>,
+    },
     /// Transition an issue to a different workflow state.
     ///
     /// Provide either `--status` (transition name) or `--transition-id`. When no option is
@@ -154,14 +272,14 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         stdout: bool,
     },
-    /// Encrypt a Jira credential using a FluxEncrypt public key.
+    /// Encrypt a Jira credential using a `FluxEncrypt` public key.
     SecretEncrypt {
         #[arg(long, value_name = "PATH", conflicts_with = "public_key_inline")]
         public_key_path: Option<PathBuf>,
         #[arg(long, value_name = "PEM", conflicts_with = "public_key_path")]
         public_key_inline: Option<String>,
         #[arg(long, value_name = "SECRET", conflicts_with_all = ["secret_file", "secret_env"])]
-        secret: Option<String>,
+        secret: Option<SecretString>,
         #[arg(long, value_name = "PATH", conflicts_with_all = ["secret", "secret_env"])]
         secret_file: Option<PathBuf>,
         #[arg(long, value_name = "NAME", conflicts_with_all = ["secret", "secret_file"])]
@@ -171,6 +289,9 @@ enum Commands {
     },
 }
 
+// `main` is a flat dispatch table over the subcommand enum; its length tracks the
+// number of subcommands, and splitting it would move code without removing a branch.
+#[allow(clippy::too_many_lines, reason = "subcommand dispatch table")]
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
@@ -264,7 +385,7 @@ async fn main() -> Result<()> {
         } => {
             let start_at = start.unwrap_or(0);
             let max_results = limit.unwrap_or(DEFAULT_ISSUE_LIMIT);
-            let jql = format!("project = {}", project);
+            let jql = project_issues_jql(&project)?;
             let results = client
                 .search_issues(&jql, start_at, max_results)
                 .await
@@ -337,13 +458,146 @@ async fn main() -> Result<()> {
                 "value": value,
             }))?;
         }
+        Commands::IssueUpdate { issue, request } => {
+            let payload: UpdateIssueRequest = load_json_file(&request).with_context(|| {
+                format!(
+                    "failed to load issue update request from {}",
+                    request.display()
+                )
+            })?;
+            let mut fields: Vec<String> = payload.fields.keys().cloned().collect();
+            fields.sort();
+            client
+                .update_issue(&issue, payload.fields)
+                .await
+                .with_context(|| format!("failed to update issue {issue}"))?;
+            print_json(&json!({
+                "issue": issue,
+                "action": "update_issue",
+                "fields": fields,
+            }))?;
+        }
+        Commands::IssueCommentAdd {
+            issue,
+            body,
+            body_file,
+        } => {
+            let comment = match (body, body_file) {
+                (Some(value), None) => value,
+                (None, Some(path)) => read_text_file(&path, "comment body")?,
+                _ => unreachable!("clap enforces exactly one comment body source"),
+            };
+            let comment = client
+                .add_issue_comment(&issue, &comment)
+                .await
+                .with_context(|| format!("failed to add comment to {issue}"))?;
+            print_json(&comment)?;
+        }
+        Commands::IssueComments {
+            issue,
+            start,
+            limit,
+        } => {
+            let comments = client
+                .get_issue_comments(
+                    &issue,
+                    start.unwrap_or(0),
+                    limit.unwrap_or(DEFAULT_ISSUE_LIMIT),
+                )
+                .await
+                .with_context(|| format!("failed to list comments for {issue}"))?;
+            print_json(&comments)?;
+        }
+        Commands::IssueAssign {
+            issue,
+            account_id,
+            unassign,
+        } => {
+            let account_id = if unassign {
+                None
+            } else {
+                account_id.as_deref()
+            };
+            client
+                .assign_issue(&issue, account_id)
+                .await
+                .with_context(|| format!("failed to update assignee for {issue}"))?;
+            print_json(&json!({
+                "issue": issue,
+                "action": "assign_issue",
+                "account_id": account_id,
+            }))?;
+        }
+        Commands::UsersSearch {
+            query,
+            start,
+            limit,
+        } => {
+            let users = client
+                .search_users(
+                    &query,
+                    start.unwrap_or(0),
+                    limit.unwrap_or(DEFAULT_USER_LIMIT),
+                )
+                .await
+                .with_context(|| format!("failed to search Jira users for {query}"))?;
+            print_json(&users)?;
+        }
+        Commands::IssueLinkCreate {
+            link_type,
+            inward,
+            outward,
+        } => {
+            client
+                .create_issue_link(&link_type, &inward, &outward)
+                .await
+                .with_context(|| format!("failed to link {inward} and {outward}"))?;
+            print_json(&json!({
+                "action": "create_issue_link",
+                "type": link_type,
+                "inward_issue": inward,
+                "outward_issue": outward,
+            }))?;
+        }
+        Commands::IssueLinkDelete { link_id } => {
+            client
+                .delete_issue_link(&link_id)
+                .await
+                .with_context(|| format!("failed to delete issue link {link_id}"))?;
+            print_json(&json!({
+                "action": "delete_issue_link",
+                "link_id": link_id,
+            }))?;
+        }
+        Commands::IssueAttachmentAdd { issue, file } => {
+            let attachments = client
+                .add_issue_attachment(&issue, &file)
+                .await
+                .with_context(|| format!("failed to attach {} to {issue}", file.display()))?;
+            print_json(&attachments)?;
+        }
+        Commands::IssueChangelog {
+            issue,
+            start,
+            limit,
+        } => {
+            let changelog = client
+                .get_issue_changelog(
+                    &issue,
+                    start.unwrap_or(0),
+                    limit.unwrap_or(DEFAULT_ISSUE_LIMIT),
+                )
+                .await
+                .with_context(|| format!("failed to retrieve changelog for {issue}"))?;
+            print_json(&changelog)?;
+        }
         Commands::IssueTransition {
             issue,
             status,
             transition_id,
             comment,
         } => {
-            let normalized_comment = normalize_comment(&comment);
+            let normalized_comment = normalize_comment(comment.as_deref());
             let comment_arg = normalized_comment.as_deref();
             let comment_added = normalized_comment.is_some();
 
@@ -404,7 +658,10 @@ async fn main() -> Result<()> {
 
 fn init_tracing(verbose: bool) {
     let level = if verbose { Level::DEBUG } else { Level::INFO };
-    let _ = tracing_subscriber::fmt().with_max_level(level).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn build_config(cli: &Cli) -> Result<AtlassianConfig> {
@@ -420,7 +677,22 @@ fn build_config(cli: &Cli) -> Result<AtlassianConfig> {
     }
 
     if let Some(agent) = &cli.user_agent {
-        config.user_agent = agent.clone();
+        config.user_agent.clone_from(agent);
+    }
+
+    // Set after `from_env_with_overrides`, which refuses `loopback` outright, so
+    // the hatch stays reachable from an operator's command line and not from the
+    // process environment.
+    if let Some(policy) = &cli.host_policy {
+        config.host_policy = policy.clone();
+    }
+
+    // Same rule, same reason: `from_env_with_overrides` does not read
+    // `JIRA_CERT_PATH` at all, because an extra trust anchor relaxes certificate
+    // verification for the destination the same environment chose. A flag is a
+    // code call the operator made deliberately.
+    if let Some(path) = &cli.cert_path {
+        config.cert_path = Some(path.clone());
     }
 
     if cli.insecure {
@@ -477,7 +749,7 @@ fn handle_keygen(
 fn handle_secret_encrypt(
     public_key_path: Option<PathBuf>,
     public_key_inline: Option<String>,
-    secret: Option<String>,
+    secret: Option<SecretString>,
     secret_file: Option<PathBuf>,
     secret_env: Option<String>,
     output: Option<PathBuf>,
@@ -495,7 +767,7 @@ fn handle_secret_encrypt(
     let secret_value = resolve_secret(secret, secret_file, secret_env)?;
     let cipher = HybridCipher::new(FluxConfig::default());
     let ciphertext = cipher
-        .encrypt(&public_key, secret_value.as_bytes())
+        .encrypt(&public_key, secret_value.expose_secret().as_bytes())
         .map_err(|err| anyhow!("failed to encrypt secret: {err}"))?;
 
     let encoded = BASE64_ENGINE.encode(ciphertext);
@@ -511,39 +783,47 @@ fn handle_secret_encrypt(
 }
 
 fn resolve_secret(
-    secret: Option<String>,
+    secret: Option<SecretString>,
     secret_file: Option<PathBuf>,
     secret_env: Option<String>,
-) -> Result<String> {
+) -> Result<SecretString> {
     if let Some(value) = secret {
-        return normalize_secret(value);
+        return normalize_secret(&value);
     }
 
     if let Some(path) = secret_file {
         let contents = read_text_file(&path, "secret")?;
-        return normalize_secret(contents);
+        return normalize_secret(&SecretString::from(contents));
     }
 
     let env_name = secret_env.unwrap_or_else(|| "JIRA_API_TOKEN".to_string());
     let value = env::var(&env_name)
         .with_context(|| format!("failed to read secret from env {env_name}"))?;
-    normalize_secret(value)
+    normalize_secret(&SecretString::from(value))
 }
 
-fn normalize_secret(value: String) -> Result<String> {
-    let trimmed = value.trim();
+fn normalize_secret(value: &SecretString) -> Result<SecretString> {
+    let trimmed = value.trimmed();
     if trimmed.is_empty() {
         bail!("Secret value cannot be empty");
     }
-    Ok(trimmed.to_string())
+    Ok(trimmed)
 }
 
-fn normalize_comment(comment: &Option<String>) -> Option<String> {
+/// Builds the query behind `project-issues`. Only `issue-search` takes JQL from
+/// the operator; a project key given here is an operand and is escaped as one.
+fn project_issues_jql(project: &str) -> Result<String> {
+    JqlBuilder::new()
+        .eq("project", project)
+        .and_then(JqlBuilder::build)
+        .with_context(|| format!("failed to build a JQL query for project {project}"))
+}
+
+fn normalize_comment(comment: Option<&str>) -> Option<String> {
     comment
-        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 fn read_text_file(path: &PathBuf, purpose: &str) -> Result<String> {
@@ -598,17 +878,191 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_comment;
+    use super::{normalize_comment, normalize_secret, project_issues_jql, Cli, Commands};
+    use clap::Parser;
+    use threatflux_atlassian_sdk::SecretString;
+
+    #[test]
+    fn project_issues_jql_quotes_the_project_key() {
+        assert_eq!(project_issues_jql("KAN").unwrap(), r#"project = "KAN""#);
+    }
+
+    #[test]
+    fn project_issues_jql_keeps_a_hostile_project_key_inside_its_literal() {
+        assert_eq!(
+            project_issues_jql(r#"KAN" OR project = "EVIL"#).unwrap(),
+            r#"project = "KAN\" OR project = \"EVIL""#
+        );
+        assert_eq!(project_issues_jql("KAN\\").unwrap(), r#"project = "KAN\\""#);
+        assert_eq!(
+            project_issues_jql("KAN ORDER BY created DESC").unwrap(),
+            r#"project = "KAN ORDER BY created DESC""#
+        );
+    }
+
+    #[test]
+    fn project_issues_jql_rejects_an_unrepresentable_project_key() {
+        let error = project_issues_jql("KA\0N").expect_err("a NUL has no JQL escape sequence");
+
+        assert!(error.to_string().contains("failed to build a JQL query"));
+        assert!(format!("{error:#}").contains("NUL character"));
+    }
 
     #[test]
     fn normalize_comment_trims_and_keeps_content() {
         let comment = Some("  Ship it  ".to_string());
-        assert_eq!(normalize_comment(&comment), Some("Ship it".to_string()));
+        assert_eq!(
+            normalize_comment(comment.as_deref()),
+            Some("Ship it".to_string())
+        );
     }
 
     #[test]
     fn normalize_comment_filters_empty_strings() {
-        assert_eq!(normalize_comment(&Some("   ".to_string())), None);
-        assert_eq!(normalize_comment(&None), None);
+        assert_eq!(normalize_comment(Some("   ")), None);
+        assert_eq!(normalize_comment(None), None);
+    }
+
+    #[test]
+    fn normalize_secret_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_secret(&SecretString::from("  token  "))
+                .unwrap()
+                .expose_secret(),
+            "token"
+        );
+        assert_eq!(
+            normalize_secret(&SecretString::from("token\n"))
+                .unwrap()
+                .expose_secret(),
+            "token"
+        );
+    }
+
+    #[test]
+    fn normalize_secret_rejects_blank_values() {
+        assert!(normalize_secret(&SecretString::from("")).is_err());
+        assert!(normalize_secret(&SecretString::from(" \t\n ")).is_err());
+    }
+
+    #[test]
+    fn parses_operator_commands() {
+        let cases = [
+            vec![
+                "tflux-atlassian",
+                "issue-comment-add",
+                "KAN-1",
+                "--body",
+                "evidence",
+            ],
+            vec![
+                "tflux-atlassian",
+                "issue-comments",
+                "KAN-1",
+                "--limit",
+                "10",
+            ],
+            vec![
+                "tflux-atlassian",
+                "issue-assign",
+                "KAN-1",
+                "--account-id",
+                "account-1",
+            ],
+            vec!["tflux-atlassian", "users-search", "--query", "Allen"],
+            vec![
+                "tflux-atlassian",
+                "issue-link-create",
+                "--link-type",
+                "Blocks",
+                "--inward",
+                "KAN-1",
+                "--outward",
+                "KAN-2",
+            ],
+            vec!["tflux-atlassian", "issue-link-delete", "10001"],
+            vec![
+                "tflux-atlassian",
+                "issue-attachment-add",
+                "KAN-1",
+                "evidence.txt",
+            ],
+            vec![
+                "tflux-atlassian",
+                "issue-changelog",
+                "KAN-1",
+                "--limit",
+                "10",
+            ],
+        ];
+
+        for args in cases {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+
+        let update =
+            Cli::try_parse_from(["tflux-atlassian", "issue-update", "KAN-1", "update.json"])
+                .unwrap();
+        assert!(matches!(update.command, Commands::IssueUpdate { .. }));
+    }
+
+    #[test]
+    fn assignment_requires_exactly_one_mode() {
+        assert!(Cli::try_parse_from(["tflux-atlassian", "issue-assign", "KAN-1"]).is_err());
+        assert!(Cli::try_parse_from([
+            "tflux-atlassian",
+            "issue-assign",
+            "KAN-1",
+            "--account-id",
+            "account-1",
+            "--unassign",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_api_token_argument_parses_into_the_secret_type() {
+        let cli = Cli::try_parse_from([
+            "tflux-atlassian",
+            "--api-token",
+            "s3cr3t-api-token",
+            "profile",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.api_token.as_ref().unwrap().expose_secret(),
+            "s3cr3t-api-token"
+        );
+    }
+
+    #[test]
+    fn a_debug_of_the_parsed_arguments_does_not_print_the_token() {
+        // `Cli` and `Commands` both derive `Debug`, and `--api-token` and
+        // `secret-encrypt --secret` are the two places a credential arrives on a
+        // command line.
+        let cli = Cli::try_parse_from([
+            "tflux-atlassian",
+            "--api-token",
+            "s3cr3t-api-token",
+            "secret-encrypt",
+            "--public-key-inline",
+            "PUBLIC KEY PEM",
+            "--secret",
+            "s3cr3t-plaintext",
+        ])
+        .unwrap();
+
+        let rendered = format!("{cli:?}");
+
+        assert!(
+            !rendered.contains("s3cr3t-api-token"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("s3cr3t-plaintext"),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("PUBLIC KEY PEM"), "rendered: {rendered}");
     }
 }

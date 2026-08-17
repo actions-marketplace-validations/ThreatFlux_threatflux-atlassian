@@ -1,39 +1,40 @@
 # ThreatFlux Rust Project Makefile
 # Standardized build, test, and development commands
-# Version: 1.0.0
+# Version: 1.1.0
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 CARGO ?= cargo
-RUST_MSRV ?= 1.94.0
-RUST_TOOLCHAIN ?= stable
+RUST_MSRV ?= 1.96.0
+RUST_TOOLCHAIN ?= 1.97.1
 
 # Docker configuration
-DOCKER_IMAGE ?= $(shell basename $(CURDIR))
+# NOTE: DOCKER_IMAGE is an explicit constant, deliberately NOT
+# $(shell basename $(CURDIR)) -- deriving it from the checkout directory breaks
+# in git worktrees, renamed clones, and CI checkout paths.
+DOCKER_IMAGE ?= threatflux-atlassian
 DOCKER_TAG ?= latest
 DOCKER_REGISTRY ?= ghcr.io/threatflux
 BINARY_PACKAGE ?= threatflux-atlassian-cli
 BINARY_NAME ?= tflux-atlassian
+SBOM_MANIFEST_PATH ?= crates/threatflux-atlassian-cli/Cargo.toml
 PUBLISH_PACKAGES ?= threatflux-atlassian-sdk threatflux-atlassian-cli
 
-# Coverage configuration
-COVERAGE_IGNORE ?=
-
-# Clippy configuration - strict by default
-CLIPPY_FLAGS := -D warnings \
-	-D clippy::all \
-	-D clippy::pedantic \
-	-D clippy::nursery \
-	-D clippy::cargo \
-	-A clippy::multiple_crate_versions \
-	-A clippy::module_name_repetitions \
-	-A clippy::missing_errors_doc \
-	-A clippy::missing_panics_doc \
-	-A clippy::must_use_candidate
+# Clippy configuration - strict by default.
+# NOTE: the lint levels themselves live in [workspace.lints.clippy] in the root
+# Cargo.toml, NOT here. A crate-root `#![allow(clippy::...)]` outranks any -D
+# passed on the command line, so a source-level suppression would silently make
+# this invocation vacuous; the manifest levels cannot be overridden that way.
+# Repeating the list here would also be a second source of truth that drifts.
+# scripts/check_lint_config.py enforces both halves. `-D warnings` stays: it is a
+# rustc level, not a Clippy one.
+CLIPPY_FLAGS := -D warnings
 
 # Colors for output
+# NOTE: these are emitted with printf, never `echo "...\n"`. POSIX leaves echo's
+# backslash handling implementation-defined and /bin/bash prints a literal \033.
 RED := \033[0;31m
 GREEN := \033[0;32m
 YELLOW := \033[0;33m
@@ -41,204 +42,231 @@ BLUE := \033[0;34m
 CYAN := \033[0;36m
 NC := \033[0m
 
+# Prerequisite lists here are ordering-sensitive (ci, all, security,
+# release-check). Under -j make would fan them out into concurrent cargo
+# invocations that then serialize on the cargo target-dir lock, producing slow,
+# interleaved and unreadable output. Keep this file serial.
+.NOTPARALLEL:
+
 # =============================================================================
 # Default Target
 # =============================================================================
 
 .DEFAULT_GOAL := help
 
-.PHONY: help
+# Every target below is phony. `docs`, `check`, `clean` and the single-letter
+# aliases in particular MUST be listed: a real docs/ directory exists at the
+# repo root, so without this make would consider `docs` up to date and silently
+# skip rustdoc and docs-check (and therefore drop them from `ci`).
+.PHONY: help dev-setup install-hooks build build-release check \
+        fmt fmt-check lint-config lint lint-strict lint-fix \
+        test test-verbose test-doc test-features test-features-full \
+        coverage coverage-html coverage-summary \
+        audit deny advisory-ignores dep-gate sbom security \
+        docs-check docs docs-open bench bench-check msrv \
+        image-pins docker-build docker-push \
+        pre-commit ci ci-quick all release-check clean \
+        f l t b c
+
 help: ## Display this help message
-	@echo "$(CYAN)ThreatFlux Rust Project - Available Commands$(NC)"
-	@echo ""
-	@echo "$(YELLOW)Quick Start:$(NC)"
-	@echo "  $(GREEN)make dev-setup$(NC)    Install all development tools"
-	@echo "  $(GREEN)make ci$(NC)           Run all CI checks locally"
-	@echo "  $(GREEN)make all$(NC)          Run full validation suite"
-	@echo ""
+	@printf '$(CYAN)ThreatFlux Rust Project - Available Commands$(NC)\n'
+	@printf '\n'
+	@printf '$(YELLOW)Quick Start:$(NC)\n'
+	@printf '  $(GREEN)make dev-setup$(NC)    Install all development tools\n'
+	@printf '  $(GREEN)make ci$(NC)           Run all CI checks locally\n'
+	@printf '  $(GREEN)make all$(NC)          Run full validation suite\n'
+	@printf '\n'
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-18s$(NC) %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-20s$(NC) %s\n", $$1, $$2}'
 
 # =============================================================================
 # Setup
 # =============================================================================
 
-.PHONY: dev-setup
 dev-setup: ## Install development tools
-	@echo "$(CYAN)Installing development tools...$(NC)"
-	@rustup component add rustfmt clippy llvm-tools-preview 2>/dev/null || true
-	@cargo install cargo-llvm-cov --locked 2>/dev/null || echo "cargo-llvm-cov already installed"
-	@cargo install cargo-audit --locked 2>/dev/null || echo "cargo-audit already installed"
-	@cargo install cargo-deny --locked 2>/dev/null || echo "cargo-deny already installed"
-	@cargo install cargo-cyclonedx --locked 2>/dev/null || echo "cargo-cyclonedx already installed"
-	@cargo install cargo-hack --locked 2>/dev/null || echo "cargo-hack already installed"
-	@echo "$(GREEN)Development tools installed!$(NC)"
+	@printf '$(CYAN)Installing development tools...$(NC)\n'
+	@rustup toolchain install $(RUST_TOOLCHAIN) --profile minimal
+	@rustup component add rustfmt clippy llvm-tools-preview --toolchain $(RUST_TOOLCHAIN)
+	@$(CARGO) install cargo-llvm-cov --locked
+	@$(CARGO) install cargo-audit --locked
+	@$(CARGO) install cargo-deny --locked
+	@$(CARGO) install cargo-cyclonedx --locked
+	@$(CARGO) install cargo-hack --locked
+	@printf '$(GREEN)Development tools installed!$(NC)\n'
 
-.PHONY: install-hooks
+# The hook body is written with printf, not `echo '...\n...'`: /bin/bash emits a
+# literal backslash-n there and the hook becomes one unrunnable line.
+# The '#' below is passed through to the shell verbatim -- inside a recipe line
+# it is not a makefile comment.
 install-hooks: ## Install git pre-commit hooks
-	@echo "$(CYAN)Installing git hooks...$(NC)"
+	@printf '$(CYAN)Installing git hooks...$(NC)\n'
 	@mkdir -p .git/hooks
-	@echo '#!/bin/sh\nmake pre-commit' > .git/hooks/pre-commit
+	@printf '#!/bin/sh\nmake pre-commit\n' > .git/hooks/pre-commit
 	@chmod +x .git/hooks/pre-commit
-	@echo "$(GREEN)Git hooks installed!$(NC)"
+	@printf '$(GREEN)Git hooks installed!$(NC)\n'
 
 # =============================================================================
 # Building
 # =============================================================================
 
-.PHONY: build
 build: ## Build the project (debug)
-	@echo "$(CYAN)Building project...$(NC)"
+	@printf '$(CYAN)Building project...$(NC)\n'
 	@$(CARGO) build --all-features
-	@echo "$(GREEN)Build completed!$(NC)"
+	@printf '$(GREEN)Build completed!$(NC)\n'
 
-.PHONY: build-release
 build-release: ## Build the project (release)
-	@echo "$(CYAN)Building release...$(NC)"
+	@printf '$(CYAN)Building release...$(NC)\n'
 	@$(CARGO) build --release --all-features
-	@echo "$(GREEN)Release build completed!$(NC)"
+	@printf '$(GREEN)Release build completed!$(NC)\n'
 
-.PHONY: check
 check: ## Check compilation without building
-	@echo "$(CYAN)Checking compilation...$(NC)"
+	@printf '$(CYAN)Checking compilation...$(NC)\n'
 	@$(CARGO) check --all-features --all-targets
 
 # =============================================================================
 # Code Quality
 # =============================================================================
 
-.PHONY: fmt
 fmt: ## Format code
-	@echo "$(CYAN)Formatting code...$(NC)"
+	@printf '$(CYAN)Formatting code...$(NC)\n'
 	@$(CARGO) fmt --all
-	@echo "$(GREEN)Formatting completed!$(NC)"
+	@printf '$(GREEN)Formatting completed!$(NC)\n'
 
-.PHONY: fmt-check
 fmt-check: ## Check code formatting
-	@echo "$(CYAN)Checking code format...$(NC)"
+	@printf '$(CYAN)Checking code format...$(NC)\n'
 	@$(CARGO) fmt --all -- --check
-	@echo "$(GREEN)Format check passed!$(NC)"
+	@printf '$(GREEN)Format check passed!$(NC)\n'
 
-.PHONY: lint
-lint: ## Run clippy linter (standard)
-	@echo "$(CYAN)Running clippy...$(NC)"
-	@$(CARGO) clippy --all-features --all-targets -- -D warnings
-	@echo "$(GREEN)Linting passed!$(NC)"
+lint-config: ## Verify the workspace Clippy configuration is not bypassed
+	@printf '$(CYAN)Checking lint configuration...$(NC)\n'
+	@python3 scripts/check_lint_config.py --self-test
+	@python3 scripts/check_lint_config.py
 
-.PHONY: lint-strict
-lint-strict: ## Run clippy with strict flags
-	@echo "$(CYAN)Running strict clippy...$(NC)"
-	@$(CARGO) clippy --all-features --all-targets -- $(CLIPPY_FLAGS)
-	@echo "$(GREEN)Strict linting passed!$(NC)"
+lint: lint-config ## Run clippy linter (standard)
+	@printf '$(CYAN)Running clippy...$(NC)\n'
+	@$(CARGO) clippy --workspace --all-features --all-targets -- $(CLIPPY_FLAGS)
+	@printf '$(GREEN)Linting passed!$(NC)\n'
 
-.PHONY: lint-fix
+# With the levels in the manifest, `lint` is already the strict invocation; this
+# target survives as an alias so existing callers keep working.
+lint-strict: lint ## Run clippy with strict flags (alias for lint)
+	@printf '$(GREEN)Strict linting passed!$(NC)\n'
+
 lint-fix: ## Run clippy and apply fixes
-	@echo "$(CYAN)Applying clippy fixes...$(NC)"
-	@$(CARGO) clippy --all-features --all-targets --fix --allow-dirty --allow-staged -- -D warnings
-	@echo "$(GREEN)Fixes applied!$(NC)"
+	@printf '$(CYAN)Applying clippy fixes...$(NC)\n'
+	@$(CARGO) clippy --workspace --all-features --all-targets --fix --allow-dirty --allow-staged -- $(CLIPPY_FLAGS)
+	@printf '$(GREEN)Fixes applied!$(NC)\n'
 
 # =============================================================================
 # Testing
 # =============================================================================
 
-.PHONY: test
 test: ## Run all tests
-	@echo "$(CYAN)Running tests...$(NC)"
+	@printf '$(CYAN)Running tests...$(NC)\n'
 	@$(CARGO) test --all-features
-	@echo "$(GREEN)Tests passed!$(NC)"
+	@printf '$(GREEN)Tests passed!$(NC)\n'
 
-.PHONY: test-verbose
 test-verbose: ## Run tests with output
-	@echo "$(CYAN)Running tests (verbose)...$(NC)"
+	@printf '$(CYAN)Running tests (verbose)...$(NC)\n'
 	@$(CARGO) test --all-features -- --nocapture
 
-.PHONY: test-doc
 test-doc: ## Run documentation tests
-	@echo "$(CYAN)Running doc tests...$(NC)"
+	@printf '$(CYAN)Running doc tests...$(NC)\n'
 	@$(CARGO) test --doc --all-features
-	@echo "$(GREEN)Doc tests passed!$(NC)"
+	@printf '$(GREEN)Doc tests passed!$(NC)\n'
 
-.PHONY: test-features
-test-features: ## Test feature combinations
-	@echo "$(CYAN)Testing feature combinations...$(NC)"
-	@echo "$(BLUE)  No default features...$(NC)"
+# `cargo test --all-features` never reaches the code that runs when
+# `encrypted-env` is off, so the missing-feature refusals need their own run.
+# Without it the whole gate is compiled but unexecuted.
+test-features: dep-gate ## Test feature combinations
+	@printf '$(CYAN)Testing feature combinations...$(NC)\n'
+	@printf '$(BLUE)  No default features...$(NC)\n'
 	@$(CARGO) check --workspace --no-default-features
-	@echo "$(BLUE)  All features...$(NC)"
+	@printf '$(BLUE)  All features...$(NC)\n'
 	@$(CARGO) check --workspace --all-features
-	@echo "$(BLUE)  Default features only...$(NC)"
+	@printf '$(BLUE)  Default features only...$(NC)\n'
 	@$(CARGO) check --workspace
-	@echo "$(GREEN)Feature checks passed!$(NC)"
+	@printf '$(BLUE)  SDK tests without encrypted-env...$(NC)\n'
+	@$(CARGO) test -p threatflux-atlassian-sdk --no-default-features --features direct,remote
+	@printf '$(GREEN)Feature checks passed!$(NC)\n'
 
-.PHONY: test-features-full
 test-features-full: ## Test all feature powerset (requires cargo-hack)
-	@echo "$(CYAN)Testing full feature powerset...$(NC)"
+	@printf '$(CYAN)Testing full feature powerset...$(NC)\n'
 	@cargo hack check --workspace --feature-powerset --no-dev-deps
-	@echo "$(GREEN)Feature powerset passed!$(NC)"
+	@printf '$(GREEN)Feature powerset passed!$(NC)\n'
 
 # =============================================================================
 # Coverage
 # =============================================================================
 
-.PHONY: coverage
 coverage: ## Generate code coverage report
-	@echo "$(CYAN)Generating coverage...$(NC)"
+	@printf '$(CYAN)Generating coverage...$(NC)\n'
 	@cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-	@echo "$(GREEN)Coverage report: lcov.info$(NC)"
+	@printf '$(GREEN)Coverage report: lcov.info$(NC)\n'
 
-.PHONY: coverage-html
 coverage-html: ## Generate HTML coverage report
-	@echo "$(CYAN)Generating HTML coverage...$(NC)"
+	@printf '$(CYAN)Generating HTML coverage...$(NC)\n'
 	@cargo llvm-cov --all-features --workspace --html
-	@echo "$(GREEN)Report: target/llvm-cov/html/index.html$(NC)"
+	@printf '$(GREEN)Report: target/llvm-cov/html/index.html$(NC)\n'
 
-.PHONY: coverage-summary
 coverage-summary: ## Show coverage summary
-	@echo "$(CYAN)Coverage summary:$(NC)"
+	@printf '$(CYAN)Coverage summary:$(NC)\n'
 	@cargo llvm-cov --all-features --workspace --summary-only
 
 # =============================================================================
 # Security
 # =============================================================================
 
-.PHONY: audit
-audit: ## Run security audit
-	@echo "$(CYAN)Running security audit...$(NC)"
-	@cargo audit --ignore RUSTSEC-2023-0071
-	@echo "$(GREEN)Security audit passed!$(NC)"
+# The ignore list lives in .cargo/audit.toml, never on this command line: a
+# `--ignore` flag here is a source of truth cargo-deny cannot see, which is how
+# three divergent copies of the same list appeared in the first place.
+# `advisory-ignores` fails the build if one comes back.
+audit: advisory-ignores ## Run security audit
+	@printf '$(CYAN)Running security audit...$(NC)\n'
+	@cargo audit
+	@printf '$(GREEN)Security audit passed!$(NC)\n'
 
-.PHONY: deny
-deny: ## Check licenses and advisories
-	@echo "$(CYAN)Running cargo-deny...$(NC)"
+deny: advisory-ignores ## Check licenses and advisories
+	@printf '$(CYAN)Running cargo-deny...$(NC)\n'
 	@cargo deny check
-	@echo "$(GREEN)Deny checks passed!$(NC)"
+	@printf '$(GREEN)Deny checks passed!$(NC)\n'
 
-.PHONY: sbom
+advisory-ignores: ## Verify .cargo/audit.toml and deny.toml ignore the same advisories
+	@printf '$(CYAN)Checking advisory ignore lists...$(NC)\n'
+	@python3 scripts/check_advisory_ignores.py --self-test
+	@python3 scripts/check_advisory_ignores.py
+
+dep-gate: ## Verify the SDK encrypted-env feature keeps fluxencrypt out of the graph
+	@printf '$(CYAN)Checking optional dependency gate...$(NC)\n'
+	@python3 scripts/check_dep_gate.py --self-test
+	@python3 scripts/check_dep_gate.py
+
 sbom: ## Generate CycloneDX SBOMs for the SDK and CLI
-	@echo "$(CYAN)Generating SBOMs...$(NC)"
+	@printf '$(CYAN)Generating SBOMs...$(NC)\n'
 	@mkdir -p sbom
-	@rm -f sbom/*.json crates/threatflux-atlassian-sdk/threatflux-atlassian-sdk-sbom.json crates/threatflux-atlassian-cli/threatflux-atlassian-cli-sbom.json
+	@rm -f sbom/*.json crates/threatflux-atlassian-sdk/*-sbom.json crates/threatflux-atlassian-cli/*-sbom.json crates/threatflux-atlassian-action/*-sbom.json
 	@cargo cyclonedx --manifest-path crates/threatflux-atlassian-sdk/Cargo.toml --all-features --format json --spec-version 1.5 --override-filename threatflux-atlassian-sdk-sbom
 	@cargo cyclonedx --manifest-path crates/threatflux-atlassian-cli/Cargo.toml --all-features --format json --spec-version 1.5 --override-filename threatflux-atlassian-cli-sbom
 	@cp crates/threatflux-atlassian-sdk/threatflux-atlassian-sdk-sbom.json sbom/
 	@cp crates/threatflux-atlassian-cli/threatflux-atlassian-cli-sbom.json sbom/
-	@rm -f crates/threatflux-atlassian-sdk/*-sbom.json crates/threatflux-atlassian-cli/*-sbom.json
-	@echo "$(GREEN)SBOMs written to sbom/$(NC)"
+	@rm -f crates/threatflux-atlassian-sdk/*-sbom.json crates/threatflux-atlassian-cli/*-sbom.json crates/threatflux-atlassian-action/*-sbom.json
+	@printf '$(GREEN)SBOMs written to sbom/$(NC)\n'
 
-.PHONY: security
 security: audit deny ## Run all security checks
-	@echo "$(GREEN)All security checks passed!$(NC)"
+	@printf '$(GREEN)All security checks passed!$(NC)\n'
 
 # =============================================================================
 # Documentation
 # =============================================================================
 
-.PHONY: docs
-docs: ## Build documentation
-	@echo "$(CYAN)Building documentation...$(NC)"
-	@RUSTDOCFLAGS="-D warnings" $(CARGO) doc --all-features --no-deps
-	@echo "$(GREEN)Documentation built!$(NC)"
+docs-check: ## Check README metadata, synchronized examples, feature flags, and local links
+	@python3 scripts/check_docs.py
 
-.PHONY: docs-open
+docs: docs-check ## Build documentation
+	@printf '$(CYAN)Building documentation...$(NC)\n'
+	@RUSTDOCFLAGS="-D warnings" $(CARGO) doc --all-features --no-deps
+	@printf '$(GREEN)Documentation built!$(NC)\n'
+
 docs-open: ## Build and open documentation
 	@$(CARGO) doc --all-features --no-deps --open
 
@@ -246,95 +274,98 @@ docs-open: ## Build and open documentation
 # Benchmarks
 # =============================================================================
 
-.PHONY: bench
 bench: ## Run benchmarks
-	@echo "$(CYAN)Running benchmarks...$(NC)"
+	@printf '$(CYAN)Running benchmarks...$(NC)\n'
 	@$(CARGO) bench --all-features
 
-.PHONY: bench-check
 bench-check: ## Check benchmarks compile
-	@echo "$(CYAN)Checking benchmarks...$(NC)"
+	@printf '$(CYAN)Checking benchmarks...$(NC)\n'
 	@$(CARGO) bench --all-features --no-run
-	@echo "$(GREEN)Benchmarks compile!$(NC)"
+	@printf '$(GREEN)Benchmarks compile!$(NC)\n'
 
 # =============================================================================
 # MSRV
 # =============================================================================
 
-.PHONY: msrv
+# `|| true` is scoped to the install: the MSRV toolchain is usually already
+# present, and the check below is what must fail.
 msrv: ## Check minimum supported Rust version
-	@echo "$(CYAN)Checking MSRV ($(RUST_MSRV))...$(NC)"
-	@rustup run $(RUST_MSRV) cargo check --all-features
-	@echo "$(GREEN)MSRV check passed!$(NC)"
+	@printf '$(CYAN)Checking MSRV (%s)...$(NC)\n' '$(RUST_MSRV)'
+	@rustup toolchain install $(RUST_MSRV) --profile minimal >/dev/null 2>&1 || true
+	@rustup run $(RUST_MSRV) cargo check --workspace --all-features
+	@printf '$(GREEN)MSRV check passed!$(NC)\n'
 
 # =============================================================================
 # Docker
 # =============================================================================
 
-.PHONY: docker-build
-docker-build: ## Build Docker image
-	@echo "$(CYAN)Building Docker image...$(NC)"
-	@docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
-	@echo "$(GREEN)Docker image built: $(DOCKER_IMAGE):$(DOCKER_TAG)$(NC)"
+image-pins: ## Verify every Dockerfile FROM is digest-pinned
+	@printf '$(CYAN)Checking container image pins...$(NC)\n'
+	@python3 scripts/check_image_pins.py --self-test
+	@python3 scripts/check_image_pins.py
 
-.PHONY: docker-push
+docker-build: image-pins ## Build Docker image
+	@printf '$(CYAN)Building Docker image...$(NC)\n'
+	@docker build \
+		--build-arg BINARY_NAME=$(BINARY_NAME) \
+		--build-arg BINARY_PACKAGE=$(BINARY_PACKAGE) \
+		--build-arg SBOM_MANIFEST_PATH=$(SBOM_MANIFEST_PATH) \
+		-t $(DOCKER_IMAGE):$(DOCKER_TAG) .
+	@printf '$(GREEN)Docker image built: %s:%s$(NC)\n' '$(DOCKER_IMAGE)' '$(DOCKER_TAG)'
+
 docker-push: ## Push Docker image to registry
-	@echo "$(CYAN)Pushing Docker image...$(NC)"
+	@printf '$(CYAN)Pushing Docker image...$(NC)\n'
 	@docker tag $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_REGISTRY)/$(DOCKER_IMAGE):$(DOCKER_TAG)
 	@docker push $(DOCKER_REGISTRY)/$(DOCKER_IMAGE):$(DOCKER_TAG)
-	@echo "$(GREEN)Image pushed!$(NC)"
+	@printf '$(GREEN)Image pushed!$(NC)\n'
 
 # =============================================================================
 # CI Targets
 # =============================================================================
 
-.PHONY: pre-commit
-pre-commit: fmt-check lint test-doc ## Pre-commit checks
-	@echo "$(GREEN)Pre-commit checks passed!$(NC)"
+pre-commit: fmt-check lint test-doc docs-check ## Pre-commit checks
+	@printf '$(GREEN)Pre-commit checks passed!$(NC)\n'
 
-.PHONY: ci
-ci: fmt-check lint test test-features docs security ## Full CI checks
-	@echo "$(GREEN)All CI checks passed!$(NC)"
+ci: fmt-check lint image-pins test test-features docs security ## Full CI checks
+	@printf '$(GREEN)All CI checks passed!$(NC)\n'
 
-.PHONY: ci-quick
-ci-quick: fmt-check lint check ## Quick CI checks
-	@echo "$(GREEN)Quick CI checks passed!$(NC)"
+ci-quick: fmt-check lint image-pins check ## Quick CI checks
+	@printf '$(GREEN)Quick CI checks passed!$(NC)\n'
 
-.PHONY: all
 all: ci coverage bench-check ## Full validation suite
-	@echo "$(GREEN)Full validation passed!$(NC)"
+	@printf '$(GREEN)Full validation passed!$(NC)\n'
 
 # =============================================================================
 # Release
 # =============================================================================
 
-.PHONY: release-check
+# `|| exit 1` is load-bearing: a for loop exits with the status of its last
+# iteration, so without it a failing sdk dry-run followed by a passing cli
+# dry-run would report success. Publish order (sdk before cli) matters.
 release-check: ## Check release readiness
-	@echo "$(CYAN)Checking release readiness...$(NC)"
+	@printf '$(CYAN)Checking release readiness...$(NC)\n'
 	@$(MAKE) ci
 	@$(MAKE) msrv
 	@for pkg in $(PUBLISH_PACKAGES); do \
-		echo "$(BLUE)  cargo publish --dry-run -p $$pkg$(NC)"; \
-		cargo publish --dry-run -p $$pkg; \
+		printf '$(BLUE)  cargo publish --dry-run -p %s$(NC)\n' "$$pkg"; \
+		cargo publish --dry-run -p "$$pkg" || exit 1; \
 	done
-	@echo "$(GREEN)Ready for release!$(NC)"
+	@printf '$(GREEN)Ready for release!$(NC)\n'
 
 # =============================================================================
 # Cleanup
 # =============================================================================
 
-.PHONY: clean
 clean: ## Clean build artifacts
-	@echo "$(CYAN)Cleaning...$(NC)"
+	@printf '$(CYAN)Cleaning...$(NC)\n'
 	@$(CARGO) clean
 	@rm -f lcov.info
-	@echo "$(GREEN)Clean completed!$(NC)"
+	@printf '$(GREEN)Clean completed!$(NC)\n'
 
 # =============================================================================
 # Aliases
 # =============================================================================
 
-.PHONY: f l t b c
 f: fmt        ## Alias: format
 l: lint       ## Alias: lint
 t: test       ## Alias: test

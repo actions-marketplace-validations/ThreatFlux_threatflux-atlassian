@@ -12,13 +12,13 @@ on:
       - "LICENSE"
       - ".gitignore"
       - "docs/**"
+  # No paths-ignore here, unlike `push` above. Branch protection requires this
+  # workflow's checks, and a check that never runs never reports, so a skipped
+  # workflow leaves a pull request permanently unmergeable rather than quickly
+  # green. A documentation-only change pays a few CI minutes; the alternative is
+  # that it cannot merge at all.
   pull_request:
     branches: [main, dev]
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
-      - ".gitignore"
-      - "docs/**"
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
@@ -30,7 +30,8 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
-  RUST_STABLE_VERSION: 1.94.0
+  RUST_STABLE_VERSION: 1.97.1
+  RUST_MSRV_VERSION: 1.96.0
 
 jobs:
   # ==========================================================================
@@ -41,7 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -50,7 +53,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -63,18 +66,34 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
+      # The lint levels live in [workspace.lints.clippy] and are deliberately not
+      # repeated below. A crate-root `#![allow(clippy::all)]` outranks a
+      # command-line -D and would leave the clippy step passing without checking
+      # anything; a command-line group -D outranks the manifest's individual
+      # allows. This checker refuses both.
+      - name: Check lint configuration
         run: |
-          cargo clippy --all-features --all-targets -- \
-            -D warnings \
-            -D clippy::all \
-            -D clippy::pedantic \
-            -D clippy::nursery \
-            -A clippy::multiple_crate_versions \
-            -A clippy::module_name_repetitions \
-            -A clippy::missing_errors_doc \
-            -A clippy::missing_panics_doc \
-            -A clippy::must_use_candidate
+          python3 scripts/check_lint_config.py --self-test
+          python3 scripts/check_lint_config.py
+
+      # The tag stays in front of the digest so the docker ecosystem declared at
+      # / in dependabot.yml can still resolve a newer version and bump both.
+      - name: Check container image pins
+        run: |
+          python3 scripts/check_image_pins.py --self-test
+          python3 scripts/check_image_pins.py
+
+      # cargo-audit reads .cargo/audit.toml and cargo-deny reads deny.toml;
+      # neither reads the other. Two lists that must stay identical need a
+      # checker, and the security workflow is too late -- an `--ignore` flag
+      # reintroduced on a command line should fail on the fast job.
+      - name: Check advisory ignore lists
+        run: |
+          python3 scripts/check_advisory_ignores.py --self-test
+          python3 scripts/check_advisory_ignores.py
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   # ==========================================================================
   # Test Suite - Cross-platform testing
@@ -106,7 +125,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -126,7 +147,7 @@ jobs:
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
 
       - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -154,15 +175,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          toolchain: ${{ env.RUST_MSRV_VERSION }}
 
       - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -171,7 +194,7 @@ jobs:
           key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check MSRV
-        run: cargo check --all-features
+        run: cargo +${{ env.RUST_MSRV_VERSION }} check --workspace --all-features
 
   # ==========================================================================
   # Feature Checks
@@ -182,7 +205,9 @@ jobs:
     needs: quick-check
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -190,12 +215,12 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@5ab5d1729c22acd8f798b267eadcfe5e5be6f5c2 # v2.68.27
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
         with:
           tool: cargo-hack
 
       - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -213,6 +238,21 @@ jobs:
       - name: Check feature combinations
         run: cargo hack check --workspace --feature-powerset --no-dev-deps --exclude-no-default-features
 
+      # `encrypted-env` is the only feature that gates dependencies, so it is the
+      # only one whose gate can silently stop holding: `default-features = false`
+      # written on a member entry instead of the workspace entry is dropped by
+      # cargo with a warning. This reads the resolved graph, not the manifests.
+      - name: Check the optional dependency gate
+        run: |
+          python3 scripts/check_dep_gate.py --self-test
+          python3 scripts/check_dep_gate.py
+
+      # The refusals that fire when `encrypted-env` is off are unreachable from
+      # `cargo test --all-features`, which is every other test invocation in this
+      # workflow.
+      - name: Test the SDK without encrypted-env
+        run: cargo test -p threatflux-atlassian-sdk --no-default-features --features direct,remote
+
   # ==========================================================================
   # Documentation
   # ==========================================================================
@@ -222,12 +262,17 @@ jobs:
     needs: quick-check
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
+
+      - name: Check documentation drift and local links
+        run: python3 scripts/check_docs.py
 
       - name: Build documentation
         run: cargo doc --all-features --no-deps
@@ -246,7 +291,9 @@ jobs:
     needs: quick-check
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -254,7 +301,7 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -275,7 +322,9 @@ jobs:
     needs: test
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -284,12 +333,12 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@5ab5d1729c22acd8f798b267eadcfe5e5be6f5c2 # v2.68.27
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
         with:
           tool: cargo-llvm-cov
 
       - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -302,7 +351,7 @@ jobs:
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
