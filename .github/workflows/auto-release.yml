@@ -33,7 +33,7 @@ jobs:
       actions: write
       contents: write
       pull-requests: write
-    uses: ThreatFlux/github_actions/.github/workflows/reusable-auto-release.yml@7a5f08885a77520db023882c8de17d9e6580b7ae # v0.7.5
+    uses: ThreatFlux/github_actions/.github/workflows/reusable-auto-release.yml@ad88f2f0cc91e6a4f2737040af917e732a53e7cc # v0.7.8
     with:
       bump: ${{ github.event.inputs.version_bump || 'auto' }}
       # main is protected with enforce_admins, so the version bump cannot be
